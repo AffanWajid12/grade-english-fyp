@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 import io
 import json
+import math
 
 # --- Dependency Imports ---
 try:
@@ -18,27 +19,21 @@ try:
     import PyPDF2
 except ImportError:
     print("Dependencies not found. Please run: pip install -r requirements.txt")
-    SentenceTransformer = None; np = None; faiss = None; PyPDF2 = None
+    SentenceTransformer, np, faiss, PyPDF2 = None, None, None, None
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
 CORS(app)
-
-# --- Caching Setup ---
 CACHE_DIR = ".rag_cache"
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
 class AIGrader:
-    """Handles the final grading, now capable of using a teacher-approved rubric."""
-    def __init__(self, strictness_level='Be balanced.', course_material=None, additional_instructions=None, rubric=None):
+    # ... (AIGrader class is unchanged from the previous version) ...
+    def __init__(self, strictness_level=None, course_material=None, additional_instructions=None):
         self.strictness_level = strictness_level or ""
         self.additional_instructions = additional_instructions or ""
-        self.rubric = rubric or None # New rubric property
         self.ollama_url = "http://localhost:11434/api/generate"
-        self.faiss_index = None
-        self.text_chunks = []
-        self.rag_model = None
+        self.faiss_index, self.text_chunks, self.rag_model = None, [], None
         if course_material and faiss and SentenceTransformer:
             self.rag_model = SentenceTransformer('all-MiniLM-L6-v2')
             self._index_course_material(course_material)
@@ -77,36 +72,37 @@ class AIGrader:
             if feedback_match: feedback = feedback_match.group(1).strip()
             if not feedback and response_text.strip(): feedback = response_text.strip()
             return max(0, min(score, max_score)), feedback
-        except Exception: return 0, f"Error parsing response. Raw: {response_text}"
+        except Exception as e: 
+            print(f"--> [ERROR] Parsing Ollama response failed: {e}")
+            return 0, f"Error parsing response. Raw: {response_text}"
 
-    def _grade_with_ollama(self, question, student_answer, question_type, max_score):
-        if not student_answer or not student_answer.strip():
-             return 0, "This is a container question with no answer to grade."
+    def _grade_with_ollama(self, question_data):
+        question = question_data.get('question', '')
+        student_answer = question_data.get('answer', '')
+        max_score = question_data.get('points', 0)
+        rubric = question_data.get('rubric', None)
+
+        if not student_answer: return 0, "This is a container question with no answer to grade."
         
         relevant_context = self._retrieve_relevant_context(question)
         
-        # --- NEW: Rubric Injection into Prompt ---
         rubric_section = ""
-        if self.rubric and isinstance(self.rubric, dict) and self.rubric.get('criteria'):
-            rubric_text = json.dumps(self.rubric['criteria'], indent=2)
-            rubric_section = f"""**Primary Grading Rubric:** You MUST use the following rubric to determine the score. The criteria listed here are the most important factor for grading.\n{rubric_text}\n"""
+        if rubric and isinstance(rubric, list):
+            try:
+                rubric_text = json.dumps(rubric, indent=2)
+                rubric_section = f"""**Primary Grading Rubric:** You MUST use the following rubric for this specific question to determine the score.\n{rubric_text}\n"""
+            except TypeError:
+                rubric_section = ""
 
-        # The rest of the prompt logic (overriding command vs. strictness) remains
-        if self.additional_instructions.strip():
-            prompt = f"""You are an AI assistant following a command.
-**Primary Directive:** Execute this command precisely: "{self.additional_instructions}"
-**Required Output Format:** SCORE: [number] FEEDBACK: [feedback]
----
-**Context:** Question: {question}, Student's Answer: "{student_answer}", Max Score: {max_score}
----
-Execute the command."""
+        if self.additional_instructions:
+            prompt = f"""**Command:** "{self.additional_instructions}"\n**Format:** SCORE: [number] FEEDBACK: [feedback]\n**Context:** Q: {question}, A: "{student_answer}", Max Score: {max_score}\nExecute."""
         else:
-            strictness_section = f'3. **Grading Strictness:** "{self.strictness_level}"' if self.strictness_level.strip() else ""
+            strictness_section = f'3. **Grading Strictness:** "{self.strictness_level}"' if self.strictness_level else ""
             context_section = f"**Reference Material:**\n{relevant_context}\n---" if relevant_context else ""
             prompt = f"""You are an expert AI exam grader.
-**Required Output Format:** SCORE: [number] FEEDBACK: [feedback]
+**Format:** SCORE: [number] FEEDBACK: [feedback]
 ---
-**Core Grading Instructions:**
+**Instructions:**
 {rubric_section}
 1. **Question:** {question}
 2. **Maximum Score:** {max_score}
@@ -116,7 +112,7 @@ Execute the command."""
 **Student's Answer:**
 "{student_answer}"
 ---
-Provide your evaluation."""
+Evaluate and provide score."""
             
         payload = {"model": "gemma", "prompt": prompt, "stream": False}
         try:
@@ -137,7 +133,7 @@ Provide your evaluation."""
         flat_exam_list = flatten_exam(student_exam)
         results = {}
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_question = {executor.submit(self._grade_with_ollama, item['question'], item['answer'], item.get('type', 'short_question'), item.get('points', 0)): item for item in flat_exam_list}
+            future_to_question = {executor.submit(self._grade_with_ollama, item): item for item in flat_exam_list}
             for future in concurrent.futures.as_completed(future_to_question):
                 item = future_to_question[future]
                 question = item['question']
@@ -145,66 +141,72 @@ Provide your evaluation."""
                 results[question] = {'score': score, 'feedback': feedback, 'student_answer': item['answer'], 'max_score': item.get('points', 0)}
         return results
 
-def call_ai_parser(prompt):
-    """Generic function to call the AI and parse its JSON response."""
+def call_ai_parser_for_rubric(prompt):
+    """Specialized parser for the rubric endpoint."""
     payload = {"model": "gemma", "prompt": prompt, "stream": False, "format": "json"}
     response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=180)
     response.raise_for_status()
     ai_response_text = response.json().get("response", "")
     try:
-        # The AI sometimes returns a string that contains a JSON object, not a pure JSON object.
-        # This robustly finds and parses the first valid JSON object in the string.
-        json_match = re.search(r'\[.*\]', ai_response_text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(0))
-        return json.loads(ai_response_text)
+        # The AI is now asked to return an object like {"rubric_criteria": [...]}, which is more robust
+        parsed_json = json.loads(ai_response_text)
+        if isinstance(parsed_json, dict) and "rubric_criteria" in parsed_json and isinstance(parsed_json["rubric_criteria"], list):
+            return parsed_json["rubric_criteria"]
+        else:
+            print(f"--> [ERROR] AI returned valid JSON, but it was not in the expected format: {ai_response_text}")
+            return None
     except json.JSONDecodeError:
         print(f"--> [ERROR] AI returned invalid JSON: {ai_response_text}")
         return None
 
-# --- NEW ENDPOINT FOR RUBRIC GENERATION ---
-@app.route('/generate_rubric', methods=['POST'])
-def generate_rubric():
-    print(f"\n{'='*50}\n--- Received RUBRIC GENERATION request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'='*50}")
+def _calculate_mark_ranges(total_marks, num_columns):
+    if num_columns <= 0: return []
+    points_per_level = total_marks / num_columns
+    ranges = []
+    level_names = {2: ["Excellent", "Needs Improvement"], 3: ["Excellent", "Good", "Needs Improvement"], 4: ["Excellent", "Good", "Satisfactory", "Needs Improvement"], 5: ["Excellent", "Very Good", "Good", "Satisfactory", "Needs Improvement"]}
+    names = level_names.get(num_columns, [f"Level {i+1}" for i in range(num_columns)])
+    upper_bound = total_marks
+    for i in range(num_columns):
+        lower_bound = math.ceil(total_marks - (i + 1) * points_per_level)
+        if i == num_columns - 1: lower_bound = 0
+        range_str = f"{upper_bound} Marks" if lower_bound == upper_bound else f"{lower_bound}-{upper_bound} Marks"
+        ranges.append(f"{range_str} ({names[i]})")
+        upper_bound = lower_bound - 1
+    return ranges
+
+@app.route('/generate_question_rubric', methods=['POST'])
+def generate_question_rubric():
+    print(f"\n{'='*50}\n--- Received PER-QUESTION RUBRIC request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'='*50}")
     data = request.json
-    exam_questions = data.get('student_exam', [])
-    
-    if not exam_questions:
-        return jsonify({"error": "No exam questions provided to generate a rubric."}), 400
+    question, total_marks, num_columns = data.get('question'), data.get('points'), data.get('columns', 3)
 
-    question_summary = "\n".join([f"- {q['question']} ({q['points']} marks)" for q in exam_questions if q.get('question')])
+    if not question or not total_marks: return jsonify({"error": "Missing question text or total marks."}), 400
 
-    prompt = f"""You are an expert in pedagogy and educational assessment. Your task is to generate 3 distinct, high-quality grading rubrics for the provided exam questions.
+    mark_ranges = _calculate_mark_ranges(total_marks, num_columns)
+    print(f"--> [RUBRIC] Calculated Mark Ranges: {mark_ranges}")
 
-**Primary Directive:** Your entire response MUST be a single JSON array containing exactly 3 rubric objects.
+    # --- FINAL, MOST ROBUST PROMPT ---
+    # Asks for a JSON object containing the list, which is more reliable.
+    prompt = f"""You are an expert in pedagogy. Your task is to generate the criteria for a pre-defined grading rubric.
+Your entire response MUST be a single, valid JSON object. Do not include any introductory text, explanations, or markdown. Your response must start with '{{' and end with '}}'.
 
-**JSON Schema for each rubric object:**
-{{
-  "title": "A creative and descriptive title for the rubric (e.g., 'Analytical Skills Rubric')",
-  "criteria": [
-    {{
-      "Criterion": "The name of a grading criterion (e.g., 'Clarity and Cohesion')",
-      "Excellent": "A description of what constitutes top performance for this criterion.",
-      "Good": "A description of average or good performance.",
-      "Needs Improvement": "A description of poor performance or what is lacking."
-    }}
-  ]
-}}
+The JSON object must have one key: "rubric_criteria". The value of this key must be an array of objects.
 
-**Exam Questions to Analyze:**
----
-{question_summary}
----
+**Instructions for the "rubric_criteria" array:**
+1.  Analyze the question: "{question}" (Worth {total_marks} marks).
+2.  The performance levels have been calculated for you. They are: {json.dumps(mark_ranges)}
+3.  The first object in the array must define the columns. It must have a "Criterion" key with the value "Description", and the other keys must be the exact mark range headers provided above.
+4.  Create at least two subsequent objects describing criteria (e.g., "Clarity", "Correctness"). For each criterion, write a description for each mark range.
 
-Now, generate the JSON array containing the 3 rubrics.
+Generate the JSON object now.
 """
     try:
-        rubrics = call_ai_parser(prompt)
-        if rubrics and isinstance(rubrics, list) and len(rubrics) > 0:
-            print(f"--> [RUBRIC] Successfully generated {len(rubrics)} rubric options.")
-            return jsonify(rubrics)
+        rubric_data = call_ai_parser_for_rubric(prompt)
+        if rubric_data:
+            print(f"--> [RUBRIC] Successfully generated rubric for question: '{question[:50]}...'")
+            return jsonify(rubric_data)
         else:
-            raise ValueError("AI did not return a valid list of rubrics.")
+            raise ValueError("AI did not return the expected JSON object structure.")
     except Exception as e:
         print(f"--> [FATAL ERROR] An unexpected error occurred during rubric generation: {e}")
         return jsonify({"error": str(e)}), 500
@@ -214,12 +216,7 @@ def grade():
     print(f"\n{'='*50}\n--- Received GRADING request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'='*50}")
     data = request.json
     try:
-        grader = AIGrader(
-            strictness_level=data.get('strictness_level', ''),
-            course_material=data.get('course_material', ''),
-            additional_instructions=data.get('additional_instructions', ''),
-            rubric=data.get('rubric', None) # Pass the rubric to the grader
-        )
+        grader = AIGrader(strictness_level=data.get('strictness_level'), course_material=data.get('course_material', ''), additional_instructions=data.get('additional_instructions', ''))
         results = grader.grade_exam(data['student_exam'])
         print(f"--- Grading complete. Sending response back to client. ---")
         return jsonify(results)
@@ -228,6 +225,6 @@ def grade():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Flask AI Grading Server with Rubric Generation...")
+    print("Starting Flask AI Grading Server with Per-Question Rubric Generation...")
     app.run(host='0.0.0.0', port=5000)
 

@@ -3,9 +3,8 @@ import requests
 import PyPDF2
 import io
 from pptx import Presentation
-import json
 
-# --- Configuration ---
+# ================== CONFIGURATION ==================
 STRICTNESS_LEVELS = {
     1: "Be extremely lenient. Award points for any attempt.",
     2: "Be very lenient. Award partial credit generously.",
@@ -18,171 +17,241 @@ STRICTNESS_LEVELS = {
     9: "Be extremely strict. The answer must be perfect.",
     10: "Be unforgiving. Any deviation results in zero points."
 }
-# --- FIX: Corrected the URL format ---
+
 BACKEND_URL_GRADE = "http://127.0.0.1:5000/grade"
 BACKEND_URL_RUBRIC = "http://127.0.0.1:5000/generate_question_rubric"
 
+# ================== HELPERS ==================
 def extract_text_from_files(uploaded_files):
+    """Extract readable text from PDF, TXT, and PPTX files."""
     full_text = []
-    if not uploaded_files: return ""
+    if not uploaded_files:
+        return ""
     for uploaded_file in uploaded_files:
         try:
             if uploaded_file.type == "text/plain":
-                full_text.append(io.StringIO(uploaded_file.getvalue().decode("utf-8")).read())
+                full_text.append(uploaded_file.getvalue().decode("utf-8"))
             elif uploaded_file.type == "application/pdf":
                 pdf_reader = PyPDF2.PdfReader(uploaded_file)
-                full_text.extend([page.extract_text() for page in pdf_reader.pages])
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        full_text.append(text)
             elif "presentationml" in uploaded_file.type:
                 prs = Presentation(io.BytesIO(uploaded_file.getvalue()))
                 for slide in prs.slides:
                     for shape in slide.shapes:
-                        if hasattr(shape, "text"): full_text.append(shape.text)
+                        if hasattr(shape, "text"):
+                            full_text.append(shape.text)
         except Exception as e:
-            st.error(f"Error processing file {uploaded_file.name}: {e}")
+            st.error(f"⚠️ Error processing file {uploaded_file.name}: {e}")
     return "\n".join(full_text)
 
+# ================== PAGE SETUP ==================
 st.set_page_config(layout="wide", page_title="AI Grading Assistant")
-st.title("📝 AI Grading Assistant v11.1 (Rubrics & Slider)")
+st.title("📝 AI Grading Assistant v12.2")
 
-if 'exam_questions' not in st.session_state: st.session_state.exam_questions = []
+if "exam_questions" not in st.session_state:
+    st.session_state.exam_questions = []
 
-# --- Sidebar ---
+# ================== SIDEBAR ==================
 with st.sidebar:
-    st.header("⚙️ Grader Configuration")
-    
+    st.header("⚙️ Configuration")
+
     use_strictness = st.toggle("Enable Strictness Level", value=True)
     strictness_instruction = ""
     if use_strictness:
-        strictness_level_num = st.slider("Select Strictness Level (1-10)", 1, 10, 6)
-        strictness_instruction = STRICTNESS_LEVELS[strictness_level_num]
-        st.info(f"**AI Instruction:** \"{strictness_instruction}\"")
-    
-    additional_instructions = st.text_area("Overriding Command (Optional)", height=150, help="This will override the strictness level.")
-    uploaded_files = st.file_uploader("Upload Course Materials (Optional)", accept_multiple_files=True, type=['pdf', 'txt', 'pptx'])
+        level = st.slider("Strictness Level", 1, 10, 6)
+        strictness_instruction = STRICTNESS_LEVELS[level]
+        st.info(f"**AI Instruction:** {strictness_instruction}")
 
-st.header("📄 Student's Exam Paper")
+    additional_instructions = st.text_area(
+        "Custom AI Command (Optional)",
+        height=150,
+        help="Overrides strictness level if filled."
+    )
 
+    uploaded_files = st.file_uploader(
+        "Upload Course Materials (Optional)",
+        type=["pdf", "txt", "pptx"],
+        accept_multiple_files=True
+    )
+
+# ================== QUESTION MANAGEMENT ==================
 def delete_question_part(path):
     data = st.session_state.exam_questions
-    for index in path[:-1]: data = data[index]['parts']
+    for idx in path[:-1]:
+        data = data[idx]["parts"]
     data.pop(path[-1])
 
 def add_sub_part(path):
     data = st.session_state.exam_questions
-    target_list = data
-    for index in path: target_list = target_list[index]['parts']
-    target_list.append({"question": "", "answer": "", "points": 1, "type": "short_question", "parts": [], "rubric": None})
+    for idx in path:
+        data = data[idx]["parts"]
+    data.append({
+        "question": "",
+        "answer": "",
+        "points": 1,
+        "type": "short_question",
+        "parts": [],
+        "rubric": None
+    })
 
 def generate_rubric_for_question(path):
+    """Generate rubric for a specific question."""
     data = st.session_state.exam_questions
     item = data
-    for index in path:
-        item = item[index] if isinstance(item, list) else item['parts'][index]
-    question_text, points, columns = item.get('question', ''), item.get('points', 0), item.get('rubric_cols', 3)
+    for idx in path:
+        item = item[idx] if isinstance(item, list) else item["parts"][idx]
+
+    question_text = item.get("question", "")
+    points = item.get("points", 0)
+    cols = item.get("rubric_cols", 3)
+    suggested_criteria = item.get("suggested_criteria", "").strip() or "auto"
+
     if not question_text or not points:
         st.warning("Please provide question text and points before generating a rubric.")
         return
-    with st.spinner(f"Generating rubric..."):
+
+    with st.spinner("Generating rubric using AI..."):
         try:
-            payload = {"question": question_text, "points": points, "columns": columns}
+            payload = {
+                "question": question_text,
+                "points": points,
+                "columns": cols,
+                "criteria": [],  # AI will handle it now
+                "suggested_criteria": suggested_criteria
+            }
             response = requests.post(BACKEND_URL_RUBRIC, json=payload)
             response.raise_for_status()
-            item['rubric'] = response.json()
+            item["rubric"] = response.json()
+            st.success("Rubric generated successfully ✅")
         except requests.exceptions.RequestException as e:
-            st.error(f"Failed to generate rubric: {e}")
+            st.error(f"❌ Failed to generate rubric: {e}")
 
-def display_questions(questions_list, path_prefix=[]):
-    for i, item in enumerate(questions_list):
-        current_path = path_prefix + [i]
-        unique_key = "-".join(map(str, current_path))
+# ================== DISPLAY QUESTIONS ==================
+def display_questions(questions, path_prefix=[]):
+    for i, item in enumerate(questions):
+        path = path_prefix + [i]
+        key_prefix = "-".join(map(str, path))
+
         with st.container(border=True):
-            cols1 = st.columns([12, 2, 2])
-            item['question'] = cols1[0].text_input("Question Text", value=item.get('question', ''), key=f"q_{unique_key}")
-            cols1[1].button("➕ Sub-part", key=f"add_{unique_key}", on_click=add_sub_part, args=(current_path,))
-            cols1[2].button("❌ Delete", key=f"del_{unique_key}", on_click=delete_question_part, args=(current_path,))
+            cols1 = st.columns([10, 2, 2])
+            item["question"] = cols1[0].text_input("Question", value=item.get("question", ""), key=f"q_{key_prefix}")
+            cols1[1].button("➕ Sub-part", key=f"add_{key_prefix}", on_click=add_sub_part, args=(path,))
+            cols1[2].button("❌ Delete", key=f"del_{key_prefix}", on_click=delete_question_part, args=(path,))
+
             cols2 = st.columns([3, 1])
-            item['type'] = cols2[0].selectbox("Type", ('mcq', 'fill_in_the_blanks', 'short_question', 'long_question'), index=2, key=f"type_{unique_key}")
-            item['points'] = cols2[1].number_input("Max Points", min_value=1, value=max(1, item.get('points', 10)), key=f"pts_{unique_key}")
-            is_container = 'parts' in item and len(item.get('parts', [])) > 0
-            if not is_container:
-                item['answer'] = st.text_area("Student's Answer", value=item.get('answer', ''), key=f"ans_{unique_key}", height=100)
-                st.markdown("###### Rubric Generation")
-                rubric_cols_ui = st.columns([2, 3])
-                item['rubric_cols'] = rubric_cols_ui[0].number_input("Rubric Columns", min_value=2, max_value=5, value=3, key=f"rub_cols_{unique_key}")
-                rubric_cols_ui[1].button("Generate AI Rubric", key=f"gen_rub_{unique_key}", on_click=generate_rubric_for_question, args=(current_path,))
-                if item.get('rubric'):
-                    st.markdown("###### Editable Rubric")
-                    item['rubric'] = st.data_editor(item['rubric'], num_rows="dynamic", use_container_width=True, key=f"edit_rub_{unique_key}")
+            item["type"] = cols2[0].selectbox(
+                "Type",
+                ("mcq", "fill_in_the_blanks", "short_question", "long_question"),
+                index=2,
+                key=f"type_{key_prefix}"
+            )
+            item["points"] = cols2[1].number_input(
+                "Max Points", min_value=1, value=max(1, item.get("points", 10)), key=f"pts_{key_prefix}"
+            )
+
+            if not item.get("parts"):
+                item["answer"] = st.text_area("Student Answer", value=item.get("answer", ""), key=f"ans_{key_prefix}", height=100)
+                st.markdown("**Rubric (Optional)**")
+                r1, r2 = st.columns(2)
+
+                # Rubric columns (still needed)
+                item["rubric_cols"] = r1.number_input("Columns", 2, 5, 3, key=f"rub_cols_{key_prefix}")
+
+                # Criteria input (AI or manual)
+                item["suggested_criteria"] = st.text_input(
+                    "Suggest Criteria (comma-separated or type 'auto' for AI generation)",
+                    key=f"sug_crit_{key_prefix}",
+                    help="Leave empty for default criteria or type 'auto' to let AI generate them."
+                )
+
+                st.button("🧠 Generate AI Rubric", key=f"rub_{key_prefix}", on_click=generate_rubric_for_question, args=(path,))
+
+                if item.get("rubric"):
+                    st.markdown("**Editable Rubric Table:**")
+                    item["rubric"] = st.data_editor(
+                        item["rubric"],
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        key=f"edit_rub_{key_prefix}"
+                    )
             else:
-                item['answer'] = ""
-                st.info("This is a container question. Gradeable answers are in the sub-parts below.")
-            if 'parts' in item and item.get('parts'):
-                display_questions(item['parts'], path_prefix=current_path)
+                st.info("This is a parent question. Gradeable answers are in its sub-parts.")
+                display_questions(item["parts"], path_prefix=path)
 
-def add_top_level_question():
-    st.session_state.exam_questions.append({"question": "", "answer": "", "points": 10, "type": "short_question", "parts": [], "rubric": None})
 
-def clear_all_questions():
-    st.session_state.exam_questions = []
-    if 'results' in st.session_state: del st.session_state.results
+# ================== ADD / CLEAR BUTTONS ==================
+st.markdown("---")
+cols = st.columns([1, 1, 3])
+cols[0].button("➕ Add Top-Level Question", on_click=lambda: st.session_state.exam_questions.append({
+    "question": "",
+    "answer": "",
+    "points": 10,
+    "type": "short_question",
+    "parts": [],
+    "rubric": None
+}))
+cols[1].button("🧹 Clear All", on_click=lambda: st.session_state.pop("exam_questions"))
 
 display_questions(st.session_state.exam_questions)
-st.markdown("---")
-bottom_cols = st.columns([1, 1, 3])
-bottom_cols[0].button("➕ Add Top-Level Question", on_click=add_top_level_question)
-bottom_cols[1].button("🧹 Clear All Questions", on_click=clear_all_questions)
 
+# ================== GRADE BUTTON ==================
+st.markdown("---")
 if st.button("🚀 Grade Exam", type="primary", use_container_width=True):
-    if not st.session_state.exam_questions: st.warning("Please add at least one question.")
+    if not st.session_state.exam_questions:
+        st.warning("Please add at least one question before grading.")
     else:
-        with st.spinner("Sending exam to the grading server..."):
-            course_material_text = extract_text_from_files(uploaded_files)
-            payload = {
-                "strictness_level": strictness_instruction,
-                "course_material": course_material_text,
-                "additional_instructions": additional_instructions,
-                "student_exam": st.session_state.exam_questions
-            }
+        with st.spinner("Grading in progress..."):
             try:
+                payload = {
+                    "strictness_level": strictness_instruction,
+                    "course_material": extract_text_from_files(uploaded_files),
+                    "additional_instructions": additional_instructions,
+                    "student_exam": st.session_state.exam_questions
+                }
                 response = requests.post(BACKEND_URL_GRADE, json=payload)
                 response.raise_for_status()
                 st.session_state.results = response.json()
-                st.success("Grading complete!")
+                st.success("✅ Grading complete!")
             except requests.exceptions.RequestException as e:
-                st.error(f"Failed to connect to the grading server: {e}")
+                st.error(f"Failed to connect to backend: {e}")
 
-if 'results' in st.session_state:
+# ================== RESULTS DISPLAY ==================
+if "results" in st.session_state:
     st.header("📊 Grading Results")
-    results_data = st.session_state.results
-    def calculate_intelligent_total(questions_list):
-        total_score, max_score = 0, 0
-        for item in questions_list:
-            is_container = 'parts' in item and len(item.get('parts', [])) > 0
-            if not is_container:
-                result = results_data.get(item.get('question', ''))
-                if result: total_score += result.get('score', 0)
-                max_score += item.get('points', 0)
-            else:
-                sub_total, sub_max = calculate_intelligent_total(item.get('parts', []))
-                total_score += sub_total; max_score += sub_max
-        return total_score, max_score
-    def display_nested_results(questions_list):
-        for item in questions_list:
-            question_text = item.get('question', '')
-            result = results_data.get(question_text)
-            if result and result.get('student_answer'):
-                with st.expander(f"**{question_text}** - Score: {result.get('score', 'N/A')} / {result.get('max_score', 'N/A')}"):
-                    st.markdown("**Student's Answer:**"); st.info(result['student_answer'])
-                    st.markdown("**AI Feedback:**"); st.success(result['feedback'])
-            if 'parts' in item and item.get('parts'):
-                display_nested_results(item['parts'])
-    if "error" in results_data:
-        st.error(f"An error occurred on the backend: {results_data['error']}")
-    else:
-        final_score, max_possible_score = calculate_intelligent_total(st.session_state.exam_questions)
-        display_nested_results(st.session_state.exam_questions)
-        st.subheader(f"🏆 Final Score: {final_score} / {max_possible_score}")
-        if st.button("Clear Results"):
-            del st.session_state.results
-            st.rerun()
+    results = st.session_state.results
 
+    def calc_total(questions):
+        total, max_total = 0, 0
+        for q in questions:
+            if q.get("parts"):
+                t, m = calc_total(q["parts"])
+                total += t
+                max_total += m
+            else:
+                result = results.get(q.get("question", ""), {})
+                total += result.get("score", 0)
+                max_total += q.get("points", 0)
+        return total, max_total
+
+    def show_results(questions):
+        for q in questions:
+            res = results.get(q.get("question", ""), {})
+            if res:
+                with st.expander(f"{q.get('question')} — {res.get('score', 0)}/{res.get('max_score', q.get('points', 0))}"):
+                    st.markdown("**Student Answer:**")
+                    st.info(res.get("student_answer", "N/A"))
+                    st.markdown("**AI Feedback:**")
+                    st.success(res.get("feedback", "No feedback provided."))
+            if q.get("parts"):
+                show_results(q["parts"])
+
+    total, max_total = calc_total(st.session_state.exam_questions)
+    st.subheader(f"🏆 Final Score: {total} / {max_total}")
+    show_results(st.session_state.exam_questions)
+
+    if st.button("🗑️ Clear Results"):
+        del st.session_state.results
+        st.rerun()

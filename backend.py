@@ -66,42 +66,89 @@ class AIGrader:
         _, indices = self.faiss_index.search(question_embedding, top_k)
         return "\n---\n".join([self.text_chunks[i] for i in indices[0]])
 
-    def _get_score_from_ai(self, question, student_answer, max_score, rubric_section, context_section):
-        prompt = f"""You are a scoring AI. Your only job is to return a single integer score.
-**Instructions:**
-{rubric_section}
-- **Question:** {question}
-- **Maximum Score:** {max_score}
-- **Student's Answer:** "{student_answer}"
-- **Reference Material:** "{context_section}"
-Based on all the information, what is the score from 0 to {max_score}? Return only the number.
-"""
+    def _get_score_from_ai(self, question, student_answer, max_score, rubric_section, context_section, additional_instructions=None, strictness_text=None):
+        """
+        Ask the LLM for a base integer score, then deterministically adjust the score
+        according to strictness_text (keyword->multiplier). The prompt is explicit about
+        priorities (rubric > teacher instructions > strictness).
+        """
+        # Build the instruction block in a clear priority order
+        priority_block = "Priority (apply in this order):\n1) Primary Grading Rubric (if provided) — MUST be followed first.\n2) Teacher's Additional Instructions — use these to emphasize or de-emphasize criteria.\n3) Strictness Level — adjust final numeric score accordingly.\n\n"
+        teacher_block = ""
+        if additional_instructions:
+            teacher_block = f"**Teacher Additional Instructions:**\n{additional_instructions}\n\n"
+
+        rubric_block = ""
+        if rubric_section:
+            rubric_block = f"**Primary Grading Rubric:**\n{rubric_section}\n\n"
+
+        # Compose the scoring prompt (very explicit)
+        prompt = (
+            "You are a precise scoring AI. Your ONLY job is to return a single integer score.\n"
+            + priority_block
+            + rubric_block
+            + teacher_block
+            + f"- Question: {question}\n"
+            + f"- Maximum Score: {max_score}\n"
+            + f'- Student Answer: "{student_answer}"\n'
+            + f'- Reference Material (if any): "{context_section}"\n\n'
+            + "IMPORTANT:\n"
+            + "1) Use the rubric first if available — match rubric criteria and mark ranges.\n"
+            + "2) Then apply teacher additional instructions (if present) to adjust emphasis or award/penalize specific behavior.\n"
+            + "3) Finally, apply the strictness level only to slightly adjust the final numeric score (the system may apply a small make-up or deduction but keep the result within bounds).\n"
+            + "Return only the integer number (0 .. {max_score}). No text, no reasoning, no punctuation.\n"
+        )
+
         payload = {"model": "gemma", "prompt": prompt, "stream": False}
         response = requests.post(self.ollama_url, json=payload, timeout=90)
         response.raise_for_status()
-        response_text = response.json().get("response", "0")
-        score_match = re.search(r'\d+', response_text)
-        score = int(score_match.group(0)) if score_match else 0
-        return max(0, min(score, max_score))
+        response_text = response.json().get("response", "").strip()
+        # extract base integer
+        m = re.search(r'-?\d+', response_text)
+        base_score = int(m.group(0)) if m else 0
+        base_score = max(0, min(base_score, max_score))
 
-    def _get_feedback_from_ai(self, question, student_answer, max_score, assigned_score, rubric_section, context_section):
-        prompt = f"""You are an expert teacher providing feedback. Your only job is to generate a formatted text explanation.
-The final score of {assigned_score}/{max_score} has already been decided.
-Your feedback string MUST be formatted with the following markdown headings:
-- **Positive Points:** (List correct points)
-- **Areas for Improvement:** (List mistakes or missed points)
-- **Summary:** (Summarize why the student received {assigned_score}/{max_score})
-**Context:**
-{rubric_section}
-- **Question:** {question}
-- **Student's Answer:** "{student_answer}"
-- **Reference Material:** "{context_section}"
-Generate the formatted feedback string now.
-"""
+        # Apply deterministic strictness multiplier
+        multiplier = self._strictness_multiplier(strictness_text or "")
+        adjusted = int(round(base_score * multiplier))
+
+        # enforce bounds
+        adjusted = max(0, min(adjusted, max_score))
+
+        # Debugging trace (prints to server logs)
+        print(f"[SCORE] question='{question[:50]}...' base_score={base_score} multiplier={multiplier} adjusted={adjusted} (max={max_score})")
+
+        return adjusted
+
+
+    def _get_feedback_from_ai(self, question, student_answer, max_score, assigned_score, rubric_section, context_section, additional_instructions=None, strictness_text=None):
+        # Compose the feedback prompt with explicit context and priority
+        priority_block = "Priority (apply in this order):\n1) Primary Grading Rubric (if provided) — MUST be used to justify points.\n2) Teacher's Additional Instructions — use to tailor feedback.\n3) Strictness Level — mention if the strictness influenced score.\n\n"
+        teacher_block = f"**Teacher Additional Instructions:**\n{additional_instructions}\n\n" if additional_instructions else ""
+        rubric_block = f"**Primary Grading Rubric:**\n{rubric_section}\n\n" if rubric_section else ""
+
+        prompt = (
+            "You are an expert teacher writing feedback. Produce feedback with the exact headings below.\n"
+            + priority_block
+            + rubric_block
+            + teacher_block
+            + f"- Question: {question}\n"
+            + f'- Student Answer: "{student_answer}"\n'
+            + f"- Maximum Score: {max_score}\n"
+            + f"- Assigned Score: {assigned_score}\n"
+            + f'- Reference Material (if any): "{context_section}"\n\n'
+            + "Your feedback MUST use these markdown headings EXACTLY:\n"
+            + "- **Positive Points:**\n"
+            + "- **Areas for Improvement:**\n"
+            + "- **Summary:**\n"
+            + "\nBe concise and reference the rubric criteria when possible. If strictness influenced scoring, note this briefly in the Summary.\n"
+        )
+
         payload = {"model": "gemma", "prompt": prompt, "stream": False}
         response = requests.post(self.ollama_url, json=payload, timeout=90)
         response.raise_for_status()
         return response.json().get("response", "Feedback could not be generated.")
+
 
     def _grade_with_ollama(self, question_data):
         question, student_answer, max_score, rubric = (question_data.get(k) for k in ['question', 'answer', 'points', 'rubric'])
@@ -113,10 +160,21 @@ Generate the formatted feedback string now.
 
         try:
             print(f"--> [GRADING-AI-1] Getting score for: '{question[:50]}...'")
-            assigned_score = self._get_score_from_ai(question, student_answer, max_score, rubric_section, relevant_context)
+            assigned_score = self._get_score_from_ai(
+                question, student_answer, max_score,
+                rubric_section, relevant_context,
+                additional_instructions=self.additional_instructions,
+                strictness_text=self.strictness_level
+            )
+
 
             print(f"--> [GRADING-AI-2] Getting feedback for score {assigned_score}/{max_score}...")
-            feedback_text = self._get_feedback_from_ai(question, student_answer, max_score, assigned_score, rubric_section, relevant_context)
+            feedback_text = self._get_feedback_from_ai(
+                question, student_answer, max_score, assigned_score,
+                rubric_section, relevant_context,
+                additional_instructions=self.additional_instructions,
+                strictness_text=self.strictness_level
+            )
 
             return assigned_score, feedback_text
         except requests.exceptions.RequestException as e:
@@ -166,6 +224,40 @@ Generate the formatted feedback string now.
 
         return results
 
+    def _strictness_multiplier(self, strictness_text):
+        """
+        Map teacher's strictness instruction text to a deterministic multiplier.
+        Multipliers >1 lenient (raise score), <1 strict (lower score).
+        The values are conservative so we don't wildly change scores.
+        """
+        if not strictness_text:
+            return 1.0
+        t = strictness_text.lower()
+        # priority map (try most specific phrases first)
+        if "unforgiving" in t or "extremely strict" in t or "extremely unforgiving" in t:
+            return 0.80
+        if "extremely lenient" in t:
+            return 1.15
+        if "very strict" in t or "be very strict" in t:
+            return 0.85
+        if "very lenient" in t:
+            return 1.10
+        if "strict" in t and "slightly" in t:
+            return 0.97
+        if "slightly strict" in t:
+            return 0.97
+        if "slightly lenient" in t:
+            return 1.03
+        if "lenient" in t and "very" not in t and "extremely" not in t:
+            return 1.05
+        if "balanced" in t or "fair" in t or "be balanced" in t:
+            return 1.0
+        # fallback: look for "lenient" or "strict"
+        if "lenient" in t:
+            return 1.05
+        if "strict" in t:
+            return 0.95
+        return 1.0
 
 
 # ------------------ Helper to call Ollama ------------------
@@ -381,7 +473,7 @@ def generate_rubrics_bulk():
                 generated[pk] = {"error": payload}
 
     return jsonify({"generated": generated, "skipped": skipped}), 200
-    
+
 
 
 @app.route('/delete_rubric', methods=['POST'])

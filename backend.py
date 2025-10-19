@@ -66,87 +66,172 @@ class AIGrader:
         _, indices = self.faiss_index.search(question_embedding, top_k)
         return "\n---\n".join([self.text_chunks[i] for i in indices[0]])
 
-    def _get_score_from_ai(self, question, student_answer, max_score, rubric_section, context_section, additional_instructions=None, strictness_text=None):
+    def _get_score_from_ai(
+        self,
+        question,
+        student_answer,
+        max_score,
+        rubric_section,
+        context_section,
+        additional_instructions=None,
+        strictness_text=None
+    ):
+        # Clean blocks
+        rubric_block = f"{rubric_section}\n" if rubric_section else ""
+        teacher_block = f"{additional_instructions}\n" if additional_instructions else ""
+        context_block = f"{context_section}\n" if context_section else ""
+
+        # Build a structured, unambiguous prompt
+        prompt = f"""
+    You are a strict and consistent grading assistant.
+    Your ONLY job is to assign a numeric score (0 to {max_score}) for the student's answer.
+
+    ---
+
+    ### STUDENT ANSWER (grade THIS only)
+    {student_answer or "(No answer provided)"}
+
+    ---
+
+    ### QUESTION
+    {question}
+
+    ---
+
+    ### GRADING MATERIALS
+    1️⃣ **Primary Grading Rubric (use this first)**
+    {rubric_block}
+
+    2️⃣ **Teacher’s Additional Instructions**
+    {teacher_block}
+
+    3️⃣ **Reference Material (context only — do NOT grade this)**
+    {context_block}
+
+    4️⃣ **Strictness Level:** {strictness_text or "Balanced"}
+
+    ---
+
+    ### INSTRUCTIONS
+    - Evaluate only the student's answer above.
+    - Use the rubric to anchor your judgment.
+    - Apply teacher instructions to fine-tune emphasis or penalize/award specific aspects.
+    - Apply the strictness level only as a *minor adjustment* (the system will fine-tune numerically afterward).
+    - Stay within the range 0 to {max_score}.
+
+    Return **only one integer** (no text, no reasoning, no punctuation).
+    Example of a valid response: `7`
         """
-        Ask the LLM for a base integer score, then deterministically adjust the score
-        according to strictness_text (keyword->multiplier). The prompt is explicit about
-        priorities (rubric > teacher instructions > strictness).
-        """
-        # Build the instruction block in a clear priority order
-        priority_block = "Priority (apply in this order):\n1) Primary Grading Rubric (if provided) — MUST be followed first.\n2) Teacher's Additional Instructions — use these to emphasize or de-emphasize criteria.\n3) Strictness Level — adjust final numeric score accordingly.\n\n"
-        teacher_block = ""
-        if additional_instructions:
-            teacher_block = f"**Teacher Additional Instructions:**\n{additional_instructions}\n\n"
 
-        rubric_block = ""
-        if rubric_section:
-            rubric_block = f"**Primary Grading Rubric:**\n{rubric_section}\n\n"
-
-        # Compose the scoring prompt (very explicit)
-        prompt = (
-            "You are a precise scoring AI. Your ONLY job is to return a single integer score.\n"
-            + priority_block
-            + rubric_block
-            + teacher_block
-            + f"- Question: {question}\n"
-            + f"- Maximum Score: {max_score}\n"
-            + f'- Student Answer: "{student_answer}"\n'
-            + f'- Reference Material (if any): "{context_section}"\n\n'
-            + "IMPORTANT:\n"
-            + "1) Use the rubric first if available — match rubric criteria and mark ranges.\n"
-            + "2) Then apply teacher additional instructions (if present) to adjust emphasis or award/penalize specific behavior.\n"
-            + "3) Finally, apply the strictness level only to slightly adjust the final numeric score (the system may apply a small make-up or deduction but keep the result within bounds).\n"
-            + "Return only the integer number (0 .. {max_score}). No text, no reasoning, no punctuation.\n"
-        )
-
+        # Send prompt to model
         payload = {"model": "gemma", "prompt": prompt, "stream": False}
         response = requests.post(self.ollama_url, json=payload, timeout=90)
         response.raise_for_status()
         response_text = response.json().get("response", "").strip()
-        # extract base integer
-        m = re.search(r'-?\d+', response_text)
+
+        # Extract base integer
+        m = re.search(r"-?\d+", response_text)
         base_score = int(m.group(0)) if m else 0
         base_score = max(0, min(base_score, max_score))
 
-        # Apply deterministic strictness multiplier
+        # Deterministic strictness multiplier
         multiplier = self._strictness_multiplier(strictness_text or "")
         adjusted = int(round(base_score * multiplier))
 
-        # enforce bounds
+        # Enforce bounds
         adjusted = max(0, min(adjusted, max_score))
 
-        # Debugging trace (prints to server logs)
-        print(f"[SCORE] question='{question[:50]}...' base_score={base_score} multiplier={multiplier} adjusted={adjusted} (max={max_score})")
+        print(
+            f"[SCORE] question='{question[:50]}...' base_score={base_score} "
+            f"multiplier={multiplier} adjusted={adjusted} (max={max_score})"
+        )
 
         return adjusted
 
+    def _get_feedback_from_ai(
+    self,
+    question,
+    student_answer,
+    max_score,
+    assigned_score,
+    rubric_section,
+    context_section,
+    additional_instructions=None,
+    strictness_text=None
+):
+        # Clean section blocks
+        rubric_block = f"{rubric_section}\n" if rubric_section else ""
+        teacher_block = f"{additional_instructions}\n" if additional_instructions else ""
+        context_block = f"{context_section}\n" if context_section else ""
 
-    def _get_feedback_from_ai(self, question, student_answer, max_score, assigned_score, rubric_section, context_section, additional_instructions=None, strictness_text=None):
-        # Compose the feedback prompt with explicit context and priority
-        priority_block = "Priority (apply in this order):\n1) Primary Grading Rubric (if provided) — MUST be used to justify points.\n2) Teacher's Additional Instructions — use to tailor feedback.\n3) Strictness Level — mention if the strictness influenced score.\n\n"
-        teacher_block = f"**Teacher Additional Instructions:**\n{additional_instructions}\n\n" if additional_instructions else ""
-        rubric_block = f"**Primary Grading Rubric:**\n{rubric_section}\n\n" if rubric_section else ""
+        # Construct the prompt in a logical order so the model can’t misinterpret context
+        prompt = f"""
+    You are an expert Computer Science teacher providing clear, structured feedback.
 
-        prompt = (
-            "You are an expert teacher writing feedback. Produce feedback with the exact headings below.\n"
-            + priority_block
-            + rubric_block
-            + teacher_block
-            + f"- Question: {question}\n"
-            + f'- Student Answer: "{student_answer}"\n'
-            + f"- Maximum Score: {max_score}\n"
-            + f"- Assigned Score: {assigned_score}\n"
-            + f'- Reference Material (if any): "{context_section}"\n\n'
-            + "Your feedback MUST use these markdown headings EXACTLY:\n"
-            + "- **Positive Points:**\n"
-            + "- **Areas for Improvement:**\n"
-            + "- **Summary:**\n"
-            + "\nBe concise and reference the rubric criteria when possible. If strictness influenced scoring, note this briefly in the Summary.\n"
-        )
+    Read the student's answer and provide feedback ONLY about that answer — not about the rubric, slides, or context.
 
+    ---
+
+    ### STUDENT ANSWER (Evaluate THIS only)
+    {student_answer or "(No answer provided)"}
+
+    ---
+
+    ### QUESTION
+    {question}
+
+    ---
+
+    ### SCORE DETAILS
+    - Maximum Score: {max_score}
+    - Assigned Score: {assigned_score}
+
+    ---
+
+    ### EVALUATION GUIDELINES
+    Use the following to guide your evaluation:
+
+    1️ **Primary Grading Rubric**
+    {rubric_block}
+
+    2️ **Teacher's Additional Instructions**
+    {teacher_block}
+
+    3️ **Reference Material (for context only, DO NOT grade this)**
+    {context_block}
+
+    4️ **Strictness Level:** {strictness_text or "Balanced"}
+
+    ---
+
+    ### OUTPUT REQUIREMENTS
+    You must respond using these exact markdown headings:
+
+    **Positive Points:**
+    - ...
+
+    **Areas for Improvement:**
+    - ...
+
+    **Summary:**
+    - ...
+
+    Include references to specific rubric criteria where relevant.
+    If strictness affected the score, mention this briefly in the Summary.
+
+    DO NOT:
+    - Critique the rubric, instructions, or slides.
+    - Restate definitions from the slides.
+    - Provide feedback about the rubric quality itself.
+
+    Focus 100% on the student's answer quality relative to the rubric and question.
+        """
+
+        # Send the request to the model
         payload = {"model": "gemma", "prompt": prompt, "stream": False}
         response = requests.post(self.ollama_url, json=payload, timeout=90)
         response.raise_for_status()
+
         return response.json().get("response", "Feedback could not be generated.")
 
 
@@ -156,7 +241,8 @@ class AIGrader:
             return 0, "This is a container question with no answer to grade."
 
         relevant_context = self._retrieve_relevant_context(question)
-        rubric_section = f"**Primary Grading Rubric:**\n{json.dumps(rubric, indent=2)}\n" if rubric and isinstance(rubric, list) else ""
+        rubric_section = json.dumps(rubric, indent=2) if rubric and isinstance(rubric, list) else ""
+
 
         try:
             print(f"--> [GRADING-AI-1] Getting score for: '{question[:50]}...'")

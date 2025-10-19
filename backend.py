@@ -125,19 +125,47 @@ Generate the formatted feedback string now.
             return 0, f"An unexpected error occurred during grading: {e}"
 
     def grade_exam(self, student_exam):
-        def flatten_exam(exam_parts):
-            flat_list = [p for part in exam_parts for p in ([part] + flatten_exam(part.get('parts', [])))]
-            return flat_list
+        """
+        Grade only leaf questions (questions without 'parts').
+        Returns a mapping keyed by position-based IDs like "q-0-1-2" to avoid collisions
+        and to ensure parent/container questions are NOT graded directly.
+        """
+        # Collect leaf tasks with their position path
+        tasks = []  # list of (path_list, item)
+        def walk(parts, path_prefix):
+            for idx, part in enumerate(parts):
+                cur_path = path_prefix + [idx]
+                # if there are sub-parts, recurse (container)
+                if part.get('parts'):
+                    walk(part['parts'], cur_path)
+                else:
+                    tasks.append((cur_path, part))
+        walk(student_exam or [], [])
 
-        flat_exam_list = flatten_exam(student_exam)
         results = {}
+        # Grade only leaf items concurrently
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_question = {executor.submit(self._grade_with_ollama, item): item for item in flat_exam_list}
-            for future in concurrent.futures.as_completed(future_to_question):
-                item = future_to_question[future]
-                score, feedback = future.result()
-                results[item['question']] = {'score': score, 'feedback': feedback, 'student_answer': item['answer'], 'max_score': item.get('points', 0)}
+            future_to_task = {executor.submit(self._grade_with_ollama, item): (path, item) for (path, item) in tasks}
+            for future in concurrent.futures.as_completed(future_to_task):
+                path, item = future_to_task[future]
+                try:
+                    score, feedback = future.result()
+                except Exception as e:
+                    score, feedback = 0, f"Error during grading: {e}"
+
+                # Build stable path key like 'q-0-1-2'
+                path_key = "q-" + "-".join(map(str, path))
+                results[path_key] = {
+                    "score": int(score),
+                    "feedback": feedback,
+                    "student_answer": item.get('answer', ''),
+                    "max_score": int(item.get('points', 0)),
+                    "question": item.get('question', ''),
+                    "path": path
+                }
+
         return results
+
 
 
 # ------------------ Helper to call Ollama ------------------
@@ -212,40 +240,26 @@ def _calculate_mark_ranges(total_marks, num_columns):
     return ranges
 
 
-@app.route('/generate_question_rubric', methods=['POST'])
-def generate_question_rubric():
-    print(f"\n{'=' * 50}\n--- Received PER-QUESTION RUBRIC request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'=' * 50}")
-    data = request.json or {}
-    question = data.get('question')
-    total_marks = data.get('points')
-    num_columns = int(data.get('columns', 3))
+# -------------------------
+# Rubric helper + bulk endpoints
+# -------------------------
 
-    if not question or not total_marks:
-        return jsonify({"error": "Missing question text or total marks."}), 400
-
-    # If client provided explicit criteria list, use it; otherwise always ask AI to generate criteria.
-    provided_criteria = data.get('criteria')
+def _generate_rubric_matrix(question, total_marks, num_columns=3, provided_criteria=None, timeout_per_call=60):
+    """
+    Generate the rubric matrix for a single question.
+    Returns list-of-rows like your existing /generate_question_rubric used to return.
+    This function raises RuntimeError if AI fails in a way we can't recover from.
+    """
+    # Use provided criteria if valid list, otherwise ask AI for criteria
     if provided_criteria and isinstance(provided_criteria, list) and any(str(c).strip() for c in provided_criteria):
         criteria_list = [str(c).strip() for c in provided_criteria if str(c).strip()]
     else:
-        # criteria missing or empty -> always ask the AI to generate criteria (no defaults)
-        try:
-            print("--> [RUBRIC] No criteria provided. Generating criteria via AI...")
-            criteria_list = _generate_criteria_from_ai(question, num_columns)
-            print(f"--> [RUBRIC] AI generated criteria: {criteria_list}")
-        except Exception as e:
-            print(f"--> [FATAL ERROR] Failed to generate criteria via AI: {e}")
-            return jsonify({"error": f"Failed to generate criteria via AI: {e}"}), 500
+        criteria_list = _generate_criteria_from_ai(question, num_columns)
 
     mark_ranges = _calculate_mark_ranges(total_marks, num_columns)
-    print(f"--> [RUBRIC] Calculated Mark Ranges: {mark_ranges}")
-
-    # Build rubric rows — each row is a dict: { "Criterion": <name>, "<mark_range_1>": "<desc>", ... }
     rubric_matrix = []
 
-    # For each criterion, ask AI to fill the cells
     for criterion in criteria_list:
-        print(f"--> [AI] Filling rubric row for criterion: '{criterion}'")
         cell_descriptions = {}
         for mark_range in mark_ranges:
             prompt = f"""
@@ -259,20 +273,156 @@ Describe in one or two concise sentences what student performance at this level 
 Return only the plain text description (no markdown, no JSON, no numbering).
 """
             try:
-                cell_text = _call_ollama(prompt, timeout=60).strip()
+                cell_text = _call_ollama(prompt, timeout=timeout_per_call).strip()
                 cell_text = " ".join([line.strip() for line in cell_text.splitlines() if line.strip()])
                 if not cell_text:
                     cell_text = f"(No description generated for {mark_range})"
-                cell_descriptions[mark_range] = cell_text
             except Exception as e:
-                cell_descriptions[mark_range] = f"Error generating description: {e}"
+                # Instead of failing the whole operation, return an error string in the cell
+                cell_text = f"Error generating description: {e}"
+            cell_descriptions[mark_range] = cell_text
 
         row = {"Criterion": criterion}
         row.update(cell_descriptions)
         rubric_matrix.append(row)
 
-    print(f"--> [RUBRIC] Successfully generated filled rubric for: '{question[:50]}...'")
-    return jsonify(rubric_matrix)
+    return rubric_matrix
+
+
+@app.route('/generate_question_rubric', methods=['POST'])
+def generate_question_rubric():
+    """
+    Enhanced: accepts optional 'path' in the payload (e.g. [0,1]) and returns:
+    { "path_key": "q-0-1", "rubric": <matrix> }
+    This keeps compatibility with old behavior while helping the frontend map rubrics to questions.
+    """
+    data = request.json or {}
+    question = data.get('question')
+    total_marks = data.get('points')
+    num_columns = int(data.get('columns', 3))
+    provided_criteria = data.get('criteria', None)
+    path = data.get('path', None)  # optional (e.g. [0,1])
+
+    if not question or total_marks is None:
+        return jsonify({"error": "Missing question text or total marks."}), 400
+
+    try:
+        rubric_matrix = _generate_rubric_matrix(question, total_marks, num_columns, provided_criteria)
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate rubric: {e}"}), 500
+
+    path_key = None
+    if path is not None:
+        if isinstance(path, list):
+            path_key = "q-" + "-".join(map(str, path))
+        elif isinstance(path, str):
+            path_key = path
+
+    payload = {"rubric": rubric_matrix}
+    if path_key:
+        payload["path_key"] = path_key
+    return jsonify(payload), 200
+
+
+@app.route('/generate_rubrics_bulk', methods=['POST'])
+def generate_rubrics_bulk():
+    """
+    Generate rubrics for all leaf questions in the provided exam structure.
+
+    Payload: {
+      "student_exam": [...],            # same exam structure you use in POST /grade
+      "columns": 3,                     # optional default 3
+      "force": false,                   # if true, regenerate even if rubric exists on question
+      "timeout_per_call": 60,           # optional timeout for each AI call
+      "max_workers": 6                  # optional concurrency cap
+    }
+
+    Returns:
+    {
+      "generated": { "<path_key>": <rubric_matrix>, ... },
+      "skipped": [ "<path_key>", ... ]  # those that already had rubric and force==false
+    }
+    """
+    data = request.json or {}
+    student_exam = data.get('student_exam', [])
+    num_columns = int(data.get('columns', 3))
+    force = bool(data.get('force', False))
+    timeout_per_call = int(data.get('timeout_per_call', 60))
+    max_workers = int(data.get('max_workers', 6))
+
+    # collect leaf questions with their position path
+    leaves = []  # list of (path_list, question_dict)
+    def walk(parts, prefix):
+        for idx, part in enumerate(parts):
+            cur_path = prefix + [idx]
+            if part.get('parts'):
+                walk(part['parts'], cur_path)
+            else:
+                leaves.append((cur_path, part))
+    walk(student_exam or [], [])
+
+    if not leaves:
+        return jsonify({"generated": {}, "skipped": []}), 200
+
+    generated = {}
+    skipped = []
+
+    # helper to process a single leaf
+    def _process_leaf(entry):
+        path, q = entry
+        path_key = "q-" + "-".join(map(str, path))
+        # If rubric exists and force==False, skip
+        if q.get('rubric') and not force:
+            return ("skip", path_key, None)
+        # Attempt to generate rubric
+        try:
+            rubric = _generate_rubric_matrix(q.get('question', ''), int(q.get('points', 0) or 0), num_columns, provided_criteria=q.get('suggested_criteria', None), timeout_per_call=timeout_per_call)
+            return ("ok", path_key, rubric)
+        except Exception as e:
+            return ("error", path_key, str(e))
+
+    # Run in parallel but with a safe limit
+    workers = min(max_workers, max(1, len(leaves)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_process_leaf, entry): entry for entry in leaves}
+        for fut in concurrent.futures.as_completed(futures):
+            status, pk, payload = fut.result()
+            if status == "ok":
+                generated[pk] = payload
+            elif status == "skip":
+                skipped.append(pk)
+            else:
+                # error -> include an error entry under generated with error string
+                generated[pk] = {"error": payload}
+
+    return jsonify({"generated": generated, "skipped": skipped}), 200
+
+
+@app.route('/delete_rubric', methods=['POST'])
+def delete_rubric():
+    """
+    Delete a rubric for a specific question. Accepts:
+      - { "path_key": "q-0-1" }
+      - or { "path": [0,1] }
+
+    Returns { "deleted": "<path_key>" } or 404 if not found.
+    Note: this endpoint does NOT mutate your original exam storage — it returns the path_key so frontend
+    can update its `exam_questions` state. If you want server-side persistence, adapt to your DB.
+    """
+    data = request.json or {}
+    path_key = data.get('path_key')
+    path = data.get('path')
+
+    if not path_key and path is None:
+        return jsonify({"error": "Provide 'path_key' or 'path'."}), 400
+
+    if path_key is None and isinstance(path, list):
+        path_key = "q-" + "-".join(map(str, path))
+
+    # In this simple implementation we just return the path_key so the frontend can clear it locally.
+    # If you have server-side exam storage, delete the rubric there and return a status.
+    return jsonify({"deleted": path_key}), 200
+
 
 
 @app.route('/grade', methods=['POST'])

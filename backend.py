@@ -170,10 +170,6 @@ Generate the formatted feedback string now.
 
 # ------------------ Helper to call Ollama ------------------
 def _call_ollama(prompt, timeout=60, model="gemma", extra_kwargs=None):
-    """
-    Call the local Ollama endpoint and return the response text.
-    Raises requests exceptions on network/HTTP errors.
-    """
     payload = {"model": model, "prompt": prompt, "stream": False}
     if extra_kwargs:
         payload.update(extra_kwargs)
@@ -183,36 +179,19 @@ def _call_ollama(prompt, timeout=60, model="gemma", extra_kwargs=None):
 
 
 def _generate_criteria_from_ai(question, num_columns):
-    """
-    Ask the AI to produce a comma-separated list of rubric criteria based on the question.
-    Returns a list of criteria strings (trimmed).
-    Raises RuntimeError on failure.
-    """
     prompt = f"""
-You are an expert teacher. Given the question below, produce a short list of rubric criterion NAMES
-that a teacher would use to grade an answer to this question. Return ONLY a single line that is
-a comma-separated list of criterion NAMES (no numbering, no explanation, no JSON, no extra text).
+You are an expert teacher. Given the question below, produce a short list of rubric criterion NAMES.
+Return ONLY a comma-separated list of criterion names.
 
 Question: "{question}"
-
-Notes:
-- Choose 3-6 concise criterion names (e.g., "Clarity", "Use of Evidence", "Comparative Analysis").
-- Return them as: Criterion1, Criterion2, Criterion3, ...
-- Do NOT include additional commentary or headings — only the comma-separated list.
-- Make the criteria tailored to the question type (if it's "compare and contrast" emphasize comparison/contrast).
 """
-
     try:
         ai_text = _call_ollama(prompt, timeout=60)
-        if not ai_text:
-            raise ValueError("AI returned empty criteria string.")
         first_line = ai_text.splitlines()[0].strip()
         criteria = [c.strip() for c in first_line.split(",") if c.strip()]
         if not criteria:
-            raise ValueError("AI did not return any valid criteria.")
+            raise ValueError("AI returned no criteria.")
         return criteria
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to contact Ollama to generate criteria: {e}")
     except Exception as e:
         raise RuntimeError(f"Error generating criteria from AI: {e}")
 
@@ -222,13 +201,12 @@ def _calculate_mark_ranges(total_marks, num_columns):
         return []
     points_per_level = total_marks / num_columns
     ranges = []
-    level_names = {
+    names = {
         2: ["Excellent", "Needs Improvement"],
         3: ["Excellent", "Good", "Needs Improvement"],
         4: ["Excellent", "Good", "Satisfactory", "Needs Improvement"],
-        5: ["Excellent", "Very Good", "Good", "Satisfactory", "Needs Improvement"]
-    }
-    names = level_names.get(num_columns, [f"Level {i+1}" for i in range(num_columns)])
+        5: ["Excellent", "Very Good", "Good", "Satisfactory", "Needs Improvement"],
+    }.get(num_columns, [f"Level {i+1}" for i in range(num_columns)])
     upper_bound = total_marks
     for i in range(num_columns):
         lower_bound = math.ceil(total_marks - (i + 1) * points_per_level)
@@ -239,18 +217,16 @@ def _calculate_mark_ranges(total_marks, num_columns):
         upper_bound = lower_bound - 1
     return ranges
 
-
 # -------------------------
 # Rubric helper + bulk endpoints
 # -------------------------
 
 def _generate_rubric_matrix(question, total_marks, num_columns=3, provided_criteria=None, timeout_per_call=60):
-    """
-    Generate the rubric matrix for a single question.
-    Returns list-of-rows like your existing /generate_question_rubric used to return.
-    This function raises RuntimeError if AI fails in a way we can't recover from.
-    """
-    # Use provided criteria if valid list, otherwise ask AI for criteria
+    """Generate rubric matrix using either provided criteria or AI-generated criteria."""
+    # 🧩 FIX: Normalize provided criteria into a list
+    if isinstance(provided_criteria, str):
+        provided_criteria = [c.strip() for c in provided_criteria.split(",") if c.strip()]
+
     if provided_criteria and isinstance(provided_criteria, list) and any(str(c).strip() for c in provided_criteria):
         criteria_list = [str(c).strip() for c in provided_criteria if str(c).strip()]
     else:
@@ -269,8 +245,8 @@ Question: "{question}"
 Criterion: "{criterion}"
 Performance level: "{mark_range}"
 
-Describe in one or two concise sentences what student performance at this level looks like for this specific criterion.
-Return only the plain text description (no markdown, no JSON, no numbering).
+Describe briefly what student performance at this level looks like for this criterion.
+Return only plain text.
 """
             try:
                 cell_text = _call_ollama(prompt, timeout=timeout_per_call).strip()
@@ -278,7 +254,6 @@ Return only the plain text description (no markdown, no JSON, no numbering).
                 if not cell_text:
                     cell_text = f"(No description generated for {mark_range})"
             except Exception as e:
-                # Instead of failing the whole operation, return an error string in the cell
                 cell_text = f"Error generating description: {e}"
             cell_descriptions[mark_range] = cell_text
 
@@ -289,34 +264,33 @@ Return only the plain text description (no markdown, no JSON, no numbering).
     return rubric_matrix
 
 
-@app.route('/generate_question_rubric', methods=['POST'])
+@app.route("/generate_question_rubric", methods=["POST"])
 def generate_question_rubric():
-    """
-    Enhanced: accepts optional 'path' in the payload (e.g. [0,1]) and returns:
-    { "path_key": "q-0-1", "rubric": <matrix> }
-    This keeps compatibility with old behavior while helping the frontend map rubrics to questions.
-    """
+    """Generate rubric for one question, respecting teacher criteria if given."""
     data = request.json or {}
-    question = data.get('question')
-    total_marks = data.get('points')
-    num_columns = int(data.get('columns', 3))
-    provided_criteria = data.get('criteria', None)
-    path = data.get('path', None)  # optional (e.g. [0,1])
+    question = data.get("question")
+    total_marks = data.get("points")
+    num_columns = int(data.get("columns", 3))
+    provided_criteria = data.get("criteria")
+    path = data.get("path")
 
     if not question or total_marks is None:
-        return jsonify({"error": "Missing question text or total marks."}), 400
+        return jsonify({"error": "Missing question or marks"}), 400
+
+    # 🧩 FIX: convert string to list if needed
+    if isinstance(provided_criteria, str):
+        provided_criteria = [c.strip() for c in provided_criteria.split(",") if c.strip()]
 
     try:
-        rubric_matrix = _generate_rubric_matrix(question, total_marks, num_columns, provided_criteria)
+        rubric_matrix = _generate_rubric_matrix(
+            question, total_marks, num_columns, provided_criteria
+        )
     except Exception as e:
         return jsonify({"error": f"Failed to generate rubric: {e}"}), 500
 
     path_key = None
     if path is not None:
-        if isinstance(path, list):
-            path_key = "q-" + "-".join(map(str, path))
-        elif isinstance(path, str):
-            path_key = path
+        path_key = "q-" + "-".join(map(str, path)) if isinstance(path, list) else str(path)
 
     payload = {"rubric": rubric_matrix}
     if path_key:
@@ -324,39 +298,25 @@ def generate_question_rubric():
     return jsonify(payload), 200
 
 
-@app.route('/generate_rubrics_bulk', methods=['POST'])
+@app.route("/generate_rubrics_bulk", methods=["POST"])
 def generate_rubrics_bulk():
-    """
-    Generate rubrics for all leaf questions in the provided exam structure.
-
-    Payload: {
-      "student_exam": [...],            # same exam structure you use in POST /grade
-      "columns": 3,                     # optional default 3
-      "force": false,                   # if true, regenerate even if rubric exists on question
-      "timeout_per_call": 60,           # optional timeout for each AI call
-      "max_workers": 6                  # optional concurrency cap
-    }
-
-    Returns:
-    {
-      "generated": { "<path_key>": <rubric_matrix>, ... },
-      "skipped": [ "<path_key>", ... ]  # those that already had rubric and force==false
-    }
+    """Generate rubrics for all leaf questions, using teacher criteria when provided.
+    Supports per-question 'columns' field (q['columns']) as override of the global 'columns'.
     """
     data = request.json or {}
-    student_exam = data.get('student_exam', [])
-    num_columns = int(data.get('columns', 3))
-    force = bool(data.get('force', False))
-    timeout_per_call = int(data.get('timeout_per_call', 60))
-    max_workers = int(data.get('max_workers', 6))
+    student_exam = data.get("student_exam", [])
+    global_num_columns = int(data.get("columns", 3))
+    force = bool(data.get("force", False))
+    timeout_per_call = int(data.get("timeout_per_call", 60))
+    max_workers = int(data.get("max_workers", 6))
 
     # collect leaf questions with their position path
-    leaves = []  # list of (path_list, question_dict)
+    leaves = []
     def walk(parts, prefix):
         for idx, part in enumerate(parts):
             cur_path = prefix + [idx]
-            if part.get('parts'):
-                walk(part['parts'], cur_path)
+            if part.get("parts"):
+                walk(part["parts"], cur_path)
             else:
                 leaves.append((cur_path, part))
     walk(student_exam or [], [])
@@ -371,12 +331,37 @@ def generate_rubrics_bulk():
     def _process_leaf(entry):
         path, q = entry
         path_key = "q-" + "-".join(map(str, path))
+
         # If rubric exists and force==False, skip
-        if q.get('rubric') and not force:
+        if q.get("rubric") and not force:
             return ("skip", path_key, None)
-        # Attempt to generate rubric
+
+        # Determine per-question columns if provided, otherwise use global
+        leaf_columns = global_num_columns
         try:
-            rubric = _generate_rubric_matrix(q.get('question', ''), int(q.get('points', 0) or 0), num_columns, provided_criteria=q.get('suggested_criteria', None), timeout_per_call=timeout_per_call)
+            # q.get('columns') may be int or string — normalize safely
+            if q.get("columns") is not None:
+                leaf_columns = int(q.get("columns"))
+        except Exception:
+            leaf_columns = global_num_columns
+
+        # Accept either 'criteria' or 'suggested_criteria' from frontend
+        provided_criteria = q.get("criteria")
+        if not provided_criteria:
+            provided_criteria = q.get("suggested_criteria")
+
+        # If provided_criteria is a comma-separated string, convert to list
+        if isinstance(provided_criteria, str):
+            provided_criteria = [c.strip() for c in provided_criteria.split(",") if c.strip()]
+
+        try:
+            rubric = _generate_rubric_matrix(
+                q.get("question", ""),
+                int(q.get("points", 0) or 0),
+                int(leaf_columns),
+                provided_criteria=provided_criteria,
+                timeout_per_call=timeout_per_call
+            )
             return ("ok", path_key, rubric)
         except Exception as e:
             return ("error", path_key, str(e))
@@ -396,6 +381,7 @@ def generate_rubrics_bulk():
                 generated[pk] = {"error": payload}
 
     return jsonify({"generated": generated, "skipped": skipped}), 200
+    
 
 
 @app.route('/delete_rubric', methods=['POST'])

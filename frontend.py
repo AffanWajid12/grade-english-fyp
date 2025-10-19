@@ -225,14 +225,48 @@ def delete_rubric_for_question(path):
     except Exception as e:
         st.error(f"Unexpected error: {e}")
 
-def generate_rubrics_for_all(force=False, columns=3, timeout_per_call=60, max_workers=6):
+def generate_rubrics_for_all(force=None, columns=None, timeout_per_call=60, max_workers=None):
     """
     Generate rubrics for all leaf questions by calling backend /generate_rubrics_bulk.
-    Updates st.session_state.exam_questions in-place with returned rubrics.
+    - If force/columns/max_workers are None they will be read from st.session_state bulk controls.
+    - Each question's rubric_cols is included as 'columns' in the transformed payload so backend
+      can optionally use per-question column counts.
     """
+    # Read UI controls if caller did not pass explicit values
+    if force is None:
+        force = bool(st.session_state.get("bulk_force", False))
+    if columns is None:
+        columns = int(st.session_state.get("bulk_cols", 3))
+    if max_workers is None:
+        max_workers = int(st.session_state.get("bulk_workers", 6))
+    timeout_per_call = int(timeout_per_call or 60)
+
+    def transform_questions(questions):
+        transformed = []
+        for q in questions:
+            q_copy = q.copy()
+            # convert suggested_criteria -> proper list for backend
+            if q_copy.get("suggested_criteria"):
+                crit_list = [c.strip() for c in q_copy["suggested_criteria"].split(",") if c.strip()]
+                q_copy["criteria"] = crit_list
+            else:
+                q_copy["criteria"] = []
+
+            # include per-question desired columns (fallback to bulk 'columns')
+            try:
+                q_copy["columns"] = int(q_copy.get("rubric_cols", columns))
+            except Exception:
+                q_copy["columns"] = int(columns)
+
+            # Recursively process parts
+            if q_copy.get("parts"):
+                q_copy["parts"] = transform_questions(q_copy["parts"])
+            transformed.append(q_copy)
+        return transformed
+
     payload = {
-        "student_exam": st.session_state.exam_questions,
-        "columns": int(columns),
+        "student_exam": transform_questions(st.session_state.exam_questions),
+        "columns": int(columns),               # overall default columns for backend
         "force": bool(force),
         "timeout_per_call": int(timeout_per_call),
         "max_workers": int(max_workers)
@@ -261,7 +295,6 @@ def generate_rubrics_for_all(force=False, columns=3, timeout_per_call=60, max_wo
                 # if rubric_or_err is dict with "error", show as error
                 if isinstance(rubric_or_err, dict) and "error" in rubric_or_err:
                     errors += 1
-                    # optionally attach an error marker to question for UI
                     try:
                         item = get_item_by_path(path)
                         item["rubric_error"] = rubric_or_err["error"]
@@ -277,12 +310,13 @@ def generate_rubrics_for_all(force=False, columns=3, timeout_per_call=60, max_wo
                     errors += 1
 
             st.session_state.exam_questions = st.session_state.exam_questions
-            msg = f"Generated rubrics applied: {applied}. Skipped (existing): {len(skipped)}. Errors: {errors}."
-            st.success(msg)
+            st.success(f"✅ Bulk rubric generation complete. Applied: {applied}, Skipped: {len(skipped)}, Errors: {errors}.")
+
         except requests.exceptions.RequestException as e:
             st.error(f"Bulk generation failed: {e}")
         except Exception as e:
             st.error(f"Unexpected error during bulk generation: {e}")
+
 
 # ================== DISPLAY QUESTIONS (stable box-in-box using expanders) ==================
 def display_questions(questions, path_prefix=[], depth=1):
@@ -385,9 +419,10 @@ cols[0].button("➕ Add Top-Level Question", on_click=lambda: st.session_state.e
 }))
 cols[1].button("🧹 Clear All", on_click=lambda: st.session_state.pop("exam_questions", None))
 
-# Bulk-rubric controls
+# Bulk-rubric controls (unchanged layout)
 bulk_cols = st.columns([2,1,1,1])
-bulk_cols[0].button("🧩 Generate rubrics for ALL leaf questions", on_click=lambda: generate_rubrics_for_all(force=False, columns=3))
+# Call the function directly — it will read bulk_* controls from st.session_state
+bulk_cols[0].button("🧩 Generate rubrics for ALL leaf questions", on_click=generate_rubrics_for_all)
 bulk_cols[1].checkbox("Force overwrite existing rubrics", key="bulk_force", value=False)
 bulk_cols[2].number_input("Columns (for bulk)", min_value=2, max_value=5, value=3, key="bulk_cols")
 bulk_cols[3].number_input("Max workers", min_value=1, max_value=12, value=6, key="bulk_workers")
@@ -412,7 +447,16 @@ if st.button("🚀 Grade Exam", type="primary", use_container_width=True):
                 response.raise_for_status()
                 # backend now returns a mapping of path-keys -> result objects
                 st.session_state.results_map = response.json()
+
+                # 🔧 Force widgets to refresh so scores/feedback update
+                st.session_state["_results_rerun_token"] = datetime.now().isoformat()
+                for k in list(st.session_state.keys()):
+                    if k.startswith("edit_state_") or k.startswith("fb_") or k.startswith("score_"):
+                        st.session_state.pop(k)
                 st.success("✅ Grading complete!")
+                st.rerun()
+
+
             except requests.exceptions.RequestException as e:
                 st.error(f"Failed to connect to backend: {e}")
 
@@ -439,10 +483,7 @@ def calc_total_from_tree(questions, results_map):
     return total, max_total
 
 def render_results_tree(questions, results_map, prefix=[]):
-    """
-    Walk the question tree and render results for leaves.
-    Containers show a subtotal line and their children inside an expander.
-    """
+    """Render question results with 'Edit Feedback' markdown toggle."""
     for idx, q in enumerate(questions):
         cur_path = prefix + [idx]
         if q.get("parts"):
@@ -453,13 +494,13 @@ def render_results_tree(questions, results_map, prefix=[]):
                 r = results_map.get(k, {})
                 subtotal += int(r.get("score", 0))
                 submax += int(leaf_q.get("points", 0))
+
             with st.expander(f"{q.get('question','(Parent)')} — Subtotal: {subtotal}/{submax}", expanded=False):
                 render_results_tree(q["parts"], results_map, prefix=cur_path)
         else:
             key = "q-" + "-".join(map(str, cur_path))
-            res = results_map.get(key)
+            res = results_map.get(key, {})
             if not res:
-                # create default entry so UI has something to edit
                 res = {
                     "score": 0,
                     "feedback": "",
@@ -469,15 +510,46 @@ def render_results_tree(questions, results_map, prefix=[]):
                 }
                 results_map[key] = res
 
-            # Show leaf result with editable controls
+            fb_key = f"fb_{key}"
+            edit_state_key = f"edit_state_{key}"
+            rerun_token = st.session_state.get("_results_rerun_token", "")
+            score_key = f"score_{key}_{rerun_token}"
+
+
+            # initialize edit mode
+            if edit_state_key not in st.session_state:
+                st.session_state[edit_state_key] = False
+
             with st.container():
                 st.markdown(f"**Question:** {res.get('question', q.get('question',''))}")
                 st.markdown("**Student Answer:**")
                 st.info(res.get("student_answer", q.get("answer", "")))
-                st.markdown("**AI Feedback (editable):**")
-                fb_key = f"fb_{key}"
-                score_key = f"score_{key}"
-                new_fb = st.text_area("Feedback", value=res.get("feedback", ""), key=fb_key, height=120)
+
+                # Feedback section
+                st.markdown("**AI Feedback:**")
+                if not st.session_state[edit_state_key]:
+                    # Show feedback as markdown
+                    st.markdown(res.get("feedback", "_No feedback yet._"))
+                    c1, c2 = st.columns([1, 3])
+                    if c1.button("✏️ Edit Feedback", key=f"editbtn_{key}"):
+                        st.session_state[edit_state_key] = True
+                        st.rerun()
+
+                else:
+                    # Show editable textarea
+                    new_fb = st.text_area("Edit Feedback", value=res.get("feedback", ""), key=fb_key, height=120)
+                    btns = st.columns([1, 1])
+                    if btns[0].button("💾 Save", key=f"save_{key}"):
+                        results_map[key]["feedback"] = new_fb
+                        st.session_state[edit_state_key] = False
+                        st.rerun()
+
+                    if btns[1].button("❌ Cancel", key=f"cancel_{key}"):
+                        st.session_state[edit_state_key] = False
+                        st.rerun()
+
+
+                # Score section
                 new_score = st.number_input(
                     "Assigned Score",
                     min_value=0,
@@ -486,9 +558,7 @@ def render_results_tree(questions, results_map, prefix=[]):
                     step=1,
                     key=score_key
                 )
-                # update results_map if changed
-                if new_fb != res.get("feedback") or int(new_score) != int(res.get("score", 0)):
-                    results_map[key]["feedback"] = new_fb
+                if int(new_score) != int(res.get("score", 0)):
                     results_map[key]["score"] = int(new_score)
 
 # show results if we have them
@@ -520,4 +590,4 @@ if "results_map" in st.session_state:
         c1.download_button("⬇️ Download edited results (JSON)", json_str, file_name="edited_results.json", mime="application/json")
         if c2.button("🗑️ Clear Results"):
             st.session_state.pop("results_map", None)
-            st.experimental_rerun()
+            st.rerun()

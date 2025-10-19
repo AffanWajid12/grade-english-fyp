@@ -28,7 +28,6 @@ CACHE_DIR = ".rag_cache"
 if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
 class AIGrader:
-    # ... (AIGrader class is unchanged from the previous version) ...
     def __init__(self, strictness_level=None, course_material=None, additional_instructions=None):
         self.strictness_level = strictness_level or ""
         self.additional_instructions = additional_instructions or ""
@@ -41,6 +40,7 @@ class AIGrader:
             print("--> AI Grader Initialized without RAG.")
 
     def _index_course_material(self, text_content):
+        # ... (This function is unchanged)
         content_hash = hashlib.md5(text_content.encode()).hexdigest()
         cache_file = os.path.join(CACHE_DIR, f"{content_hash}.pkl")
         if os.path.exists(cache_file):
@@ -58,23 +58,54 @@ class AIGrader:
             pickle.dump({'chunks': self.text_chunks, 'index': faiss.serialize_index(self.faiss_index)}, f)
 
     def _retrieve_relevant_context(self, question, top_k=3):
+        # ... (This function is unchanged)
         if not self.faiss_index or not self.rag_model: return ""
         question_embedding = self.rag_model.encode([question])
         _, indices = self.faiss_index.search(question_embedding, top_k)
         return "\n---\n".join([self.text_chunks[i] for i in indices[0]])
 
-    def _parse_ollama_response(self, response_text, max_score):
-        try:
-            score, feedback = 0, ""
-            score_match = re.search(r'score\D*(\d+)', response_text, re.IGNORECASE)
-            if score_match: score = int(score_match.group(1))
-            feedback_match = re.search(r'FEEDBACK:(.*)', response_text, re.IGNORECASE | re.DOTALL)
-            if feedback_match: feedback = feedback_match.group(1).strip()
-            if not feedback and response_text.strip(): feedback = response_text.strip()
-            return max(0, min(score, max_score)), feedback
-        except Exception as e: 
-            print(f"--> [ERROR] Parsing Ollama response failed: {e}")
-            return 0, f"Error parsing response. Raw: {response_text}"
+    def _get_score_from_ai(self, question, student_answer, max_score, rubric_section, context_section):
+        """AI Call #1: Get only the numerical score."""
+        prompt = f"""You are a scoring AI. Your only job is to return a single integer score.
+**Instructions:**
+{rubric_section}
+- **Question:** {question}
+- **Maximum Score:** {max_score}
+- **Student's Answer:** "{student_answer}"
+- **Reference Material:** "{context_section}"
+Based on all the information, what is the score from 0 to {max_score}? Return only the number.
+"""
+        payload = {"model": "gemma", "prompt": prompt, "stream": False}
+        response = requests.post(self.ollama_url, json=payload, timeout=90)
+        response.raise_for_status()
+        response_text = response.json().get("response", "0")
+        # Extract the first number found in the response for robustness
+        score_match = re.search(r'\d+', response_text)
+        score = int(score_match.group(0)) if score_match else 0
+        return max(0, min(score, max_score))
+
+    def _get_feedback_from_ai(self, question, student_answer, max_score, assigned_score, rubric_section, context_section):
+        """AI Call #2: Get only the formatted text feedback."""
+        prompt = f"""You are an expert teacher providing feedback. Your only job is to generate a formatted text explanation.
+The final score of {assigned_score}/{max_score} has already been decided.
+
+Your feedback string MUST be formatted with the following markdown headings, each on a new line:
+- **Positive Points:** (List the specific points the student answered correctly)
+- **Areas for Improvement:** (List the mistakes or missed points that led to the score of {assigned_score})
+- **Summary:** (A concise, one-paragraph summary of why the student received {assigned_score}/{max_score})
+
+**Context:**
+{rubric_section}
+- **Question:** {question}
+- **Student's Answer:** "{student_answer}"
+- **Reference Material:** "{context_section}"
+
+Generate the formatted feedback string now.
+"""
+        payload = {"model": "gemma", "prompt": prompt, "stream": False}
+        response = requests.post(self.ollama_url, json=payload, timeout=90)
+        response.raise_for_status()
+        return response.json().get("response", "Feedback could not be generated.")
 
     def _grade_with_ollama(self, question_data):
         question = question_data.get('question', '')
@@ -88,41 +119,29 @@ class AIGrader:
         
         rubric_section = ""
         if rubric and isinstance(rubric, list):
-            try:
-                rubric_text = json.dumps(rubric, indent=2)
-                rubric_section = f"""**Primary Grading Rubric:** You MUST use the following rubric for this specific question to determine the score.\n{rubric_text}\n"""
-            except TypeError:
-                rubric_section = ""
-
-        if self.additional_instructions:
-            prompt = f"""**Command:** "{self.additional_instructions}"\n**Format:** SCORE: [number] FEEDBACK: [feedback]\n**Context:** Q: {question}, A: "{student_answer}", Max Score: {max_score}\nExecute."""
-        else:
-            strictness_section = f'3. **Grading Strictness:** "{self.strictness_level}"' if self.strictness_level else ""
-            context_section = f"**Reference Material:**\n{relevant_context}\n---" if relevant_context else ""
-            prompt = f"""You are an expert AI exam grader.
-**Format:** SCORE: [number] FEEDBACK: [feedback]
----
-**Instructions:**
-{rubric_section}
-1. **Question:** {question}
-2. **Maximum Score:** {max_score}
-{strictness_section}
-{context_section}
----
-**Student's Answer:**
-"{student_answer}"
----
-Evaluate and provide score."""
-            
-        payload = {"model": "gemma", "prompt": prompt, "stream": False}
+            rubric_text = json.dumps(rubric, indent=2)
+            rubric_section = f"""**Primary Grading Rubric:**\n{rubric_text}\n"""
+        
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=90)
-            response.raise_for_status()
-            return self._parse_ollama_response(response.json().get("response", ""), max_score)
+            # --- TWO-STEP PROCESS ---
+            # Step 1: Get the score
+            print(f"--> [GRADING-AI-1] Getting score for: '{question[:50]}...'")
+            assigned_score = self._get_score_from_ai(question, student_answer, max_score, rubric_section, relevant_context)
+            
+            # Step 2: Get the feedback based on the score
+            print(f"--> [GRADING-AI-2] Getting feedback for score {assigned_score}/{max_score}...")
+            feedback_text = self._get_feedback_from_ai(question, student_answer, max_score, assigned_score, rubric_section, relevant_context)
+            
+            # Step 3: Manually assemble the final result
+            return assigned_score, feedback_text
+
         except requests.exceptions.RequestException as e:
             return 0, f"Error communicating with Ollama: {e}"
+        except Exception as e:
+            return 0, f"An unexpected error occurred during grading: {e}"
 
     def grade_exam(self, student_exam):
+        # ... (This function is unchanged)
         def flatten_exam(exam_parts):
             flat_list = []
             for part in exam_parts:
@@ -142,24 +161,22 @@ Evaluate and provide score."""
         return results
 
 def call_ai_parser_for_rubric(prompt):
-    """Specialized parser for the rubric endpoint."""
+    # ... (This function is unchanged)
     payload = {"model": "gemma", "prompt": prompt, "stream": False, "format": "json"}
     response = requests.post("http://localhost:11434/api/generate", json=payload, timeout=180)
     response.raise_for_status()
     ai_response_text = response.json().get("response", "")
     try:
-        # The AI is now asked to return an object like {"rubric_criteria": [...]}, which is more robust
         parsed_json = json.loads(ai_response_text)
         if isinstance(parsed_json, dict) and "rubric_criteria" in parsed_json and isinstance(parsed_json["rubric_criteria"], list):
             return parsed_json["rubric_criteria"]
         else:
-            print(f"--> [ERROR] AI returned valid JSON, but it was not in the expected format: {ai_response_text}")
             return None
     except json.JSONDecodeError:
-        print(f"--> [ERROR] AI returned invalid JSON: {ai_response_text}")
         return None
 
 def _calculate_mark_ranges(total_marks, num_columns):
+    # ... (This function is unchanged)
     if num_columns <= 0: return []
     points_per_level = total_marks / num_columns
     ranges = []
@@ -176,55 +193,39 @@ def _calculate_mark_ranges(total_marks, num_columns):
 
 @app.route('/generate_question_rubric', methods=['POST'])
 def generate_question_rubric():
-    print(f"\n{'='*50}\n--- Received PER-QUESTION RUBRIC request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'='*50}")
+    # ... (This function is unchanged)
     data = request.json
     question, total_marks, num_columns = data.get('question'), data.get('points'), data.get('columns', 3)
-
     if not question or not total_marks: return jsonify({"error": "Missing question text or total marks."}), 400
-
     mark_ranges = _calculate_mark_ranges(total_marks, num_columns)
-    print(f"--> [RUBRIC] Calculated Mark Ranges: {mark_ranges}")
-
-    # --- FINAL, MOST ROBUST PROMPT ---
-    # Asks for a JSON object containing the list, which is more reliable.
-    prompt = f"""You are an expert in pedagogy. Your task is to generate the criteria for a pre-defined grading rubric.
-Your entire response MUST be a single, valid JSON object. Do not include any introductory text, explanations, or markdown. Your response must start with '{{' and end with '}}'.
-
-The JSON object must have one key: "rubric_criteria". The value of this key must be an array of objects.
-
+    prompt = f"""Your entire response MUST be a single, valid JSON object with one key: "rubric_criteria". The value must be an array of objects.
 **Instructions for the "rubric_criteria" array:**
 1.  Analyze the question: "{question}" (Worth {total_marks} marks).
-2.  The performance levels have been calculated for you. They are: {json.dumps(mark_ranges)}
-3.  The first object in the array must define the columns. It must have a "Criterion" key with the value "Description", and the other keys must be the exact mark range headers provided above.
-4.  Create at least two subsequent objects describing criteria (e.g., "Clarity", "Correctness"). For each criterion, write a description for each mark range.
-
-Generate the JSON object now.
-"""
+2.  The performance levels are: {json.dumps(mark_ranges)}
+3.  The first object must define the columns: a "Criterion" key with the value "Description", and other keys being the exact mark range headers.
+4.  Create subsequent objects for criteria like "Clarity", "Correctness".
+Generate the JSON object now."""
     try:
         rubric_data = call_ai_parser_for_rubric(prompt)
         if rubric_data:
-            print(f"--> [RUBRIC] Successfully generated rubric for question: '{question[:50]}...'")
             return jsonify(rubric_data)
         else:
             raise ValueError("AI did not return the expected JSON object structure.")
     except Exception as e:
-        print(f"--> [FATAL ERROR] An unexpected error occurred during rubric generation: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/grade', methods=['POST'])
 def grade():
-    print(f"\n{'='*50}\n--- Received GRADING request at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n{'='*50}")
+    # ... (This function is unchanged)
     data = request.json
     try:
         grader = AIGrader(strictness_level=data.get('strictness_level'), course_material=data.get('course_material', ''), additional_instructions=data.get('additional_instructions', ''))
         results = grader.grade_exam(data['student_exam'])
-        print(f"--- Grading complete. Sending response back to client. ---")
         return jsonify(results)
     except Exception as e:
-        print(f"--> [FATAL ERROR] An unexpected error occurred in the /grade endpoint: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Flask AI Grading Server with Per-Question Rubric Generation...")
+    print("Starting Flask AI Grading Server with Two-Step Grading Pipeline...")
     app.run(host='0.0.0.0', port=5000)
 

@@ -1,0 +1,10 @@
+flask
+flask-cors
+requests
+sentence-transformers
+numpy
+faiss-cpu
+PyPDF2
+pytest
+pytest-mock
+python-pptx
